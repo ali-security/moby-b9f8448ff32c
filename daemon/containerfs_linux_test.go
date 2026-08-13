@@ -4,10 +4,15 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"github.com/docker/docker/container"
+	"github.com/moby/sys/mount"
+	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -215,6 +220,109 @@ func TestCreateIfNotExists(t *testing.T) {
 	})
 }
 
+func TestOpenMountTarget(t *testing.T) {
+	t.Run("resolves within root", func(t *testing.T) {
+		root := t.TempDir()
+		assert.NilError(t, os.Mkdir(filepath.Join(root, "dest"), 0o755))
+
+		f, targetPath, err := openMountTarget(root, "dest")
+		assert.NilError(t, err)
+		defer f.Close()
+
+		resolved, err := os.Readlink(targetPath)
+		assert.NilError(t, err)
+
+		want, err := os.Stat(filepath.Join(root, "dest"))
+		assert.NilError(t, err)
+		got, err := os.Stat(resolved)
+		assert.NilError(t, err)
+		assert.Check(t, os.SameFile(want, got), "fd does not refer to the in-root destination")
+	})
+	t.Run("absolute symlink at the destination cannot escape the root", func(t *testing.T) {
+		root, outside := scratchRootAndOutside(t)
+		// An absolute symlink is resolved relative to the root, so the
+		// path it can ever reach is <root>/<outside>, not <outside>.
+		mirrored := filepath.Join(root, outside)
+		assert.NilError(t, os.MkdirAll(mirrored, 0o755))
+		assert.NilError(t, os.Symlink(outside, filepath.Join(root, "dest")))
+
+		f, targetPath, err := openMountTarget(root, "dest")
+		assert.NilError(t, err)
+		defer f.Close()
+
+		resolved, err := os.Readlink(targetPath)
+		assert.NilError(t, err)
+
+		inRoot, err := os.Stat(mirrored)
+		assert.NilError(t, err)
+		got, err := os.Stat(resolved)
+		assert.NilError(t, err)
+		assert.Check(t, os.SameFile(inRoot, got), "fd escaped the root, resolved to %q", resolved)
+
+		hostDir, err := os.Stat(outside)
+		assert.NilError(t, err)
+		assert.Check(t, !os.SameFile(hostDir, got), "fd resolved to the host directory %q", outside)
+	})
+	t.Run("parent traversal is clamped to root", func(t *testing.T) {
+		root, _ := scratchRootAndOutside(t)
+		assert.NilError(t, os.MkdirAll(filepath.Join(root, "a", "b"), 0o755))
+
+		f, targetPath, err := openMountTarget(root, filepath.Join("a", "b", "..", "..", "..", ".."))
+		assert.NilError(t, err)
+		defer f.Close()
+
+		resolved, err := os.Readlink(targetPath)
+		assert.NilError(t, err)
+
+		rootInfo, err := os.Stat(root)
+		assert.NilError(t, err)
+		got, err := os.Stat(resolved)
+		assert.NilError(t, err)
+		assert.Check(t, os.SameFile(rootInfo, got), "traversal escaped the root, resolved to %q", resolved)
+	})
+	t.Run("fd pins the destination against a symlink swap", func(t *testing.T) {
+		// This is the vulnerability: between resolving the mount
+		// destination by name and mounting onto it, a process inside the
+		// container can swap the destination for a symlink pointing at a
+		// host path. Using the fd as the mount target defeats that.
+		root, outside := scratchRootAndOutside(t)
+		dest := filepath.Join(root, "dest")
+		assert.NilError(t, os.Mkdir(dest, 0o755))
+
+		f, targetPath, err := openMountTarget(root, "dest")
+		assert.NilError(t, err)
+		defer f.Close()
+
+		// Perform the swap after the destination has been resolved.
+		assert.NilError(t, os.Rename(dest, filepath.Join(root, "stashed")))
+		assert.NilError(t, os.Symlink(outside, dest))
+
+		// By-name resolution (the pre-fix behaviour) now lands on the
+		// host directory...
+		byName, err := filepath.EvalSymlinks(dest)
+		assert.NilError(t, err)
+		hostDir, err := os.Stat(outside)
+		assert.NilError(t, err)
+		byNameInfo, err := os.Stat(byName)
+		assert.NilError(t, err)
+		assert.Check(t, os.SameFile(hostDir, byNameInfo),
+			"test setup is not reproducing the swap: %q did not resolve to %q", dest, outside)
+
+		// ...while the fd-pinned target still refers to the original
+		// in-root inode, which is what gets mounted onto.
+		resolved, err := os.Readlink(targetPath)
+		assert.NilError(t, err)
+		pinned, err := os.Stat(resolved)
+		assert.NilError(t, err)
+		stashed, err := os.Stat(filepath.Join(root, "stashed"))
+		assert.NilError(t, err)
+		assert.Check(t, os.SameFile(stashed, pinned),
+			"mount target followed the symlink swap, resolved to %q", resolved)
+		assert.Check(t, !os.SameFile(hostDir, pinned),
+			"mount target was redirected to the host path %q", outside)
+	})
+}
+
 // outsideBaseName is the base name of the out-of-root scratch directory created
 // by scratchRootAndOutside. It doubles as the path an absolute in-container
 // symlink to that directory resolves to once scoped to the root.
@@ -243,4 +351,120 @@ func assertEmptyDir(t *testing.T, dir string) {
 		names = append(names, e.Name())
 	}
 	assert.Check(t, is.Len(names, 0), "entries were created outside the root: %v", names)
+}
+
+// TestMountPinnedTarget is the executed regression test for CVE-2026-42306. It
+// performs the real bind mount, with the symlink swap the CVE describes landing
+// in the window between the destination being resolved by openMountTarget and
+// the mount syscall issued by mountPinnedTarget.
+//
+// It needs to actually mount, so it runs as root in a private mount namespace
+// on a dedicated thread; the namespace (and every mount made in it) goes away
+// when that thread does.
+func TestMountPinnedTarget(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("bind mounting requires root")
+	}
+
+	t.Run("mounts onto the resolved destination", func(t *testing.T) {
+		root, source := t.TempDir(), t.TempDir()
+		assert.NilError(t, os.Mkdir(filepath.Join(root, "dst"), 0o755))
+		assert.NilError(t, os.WriteFile(filepath.Join(source, "marker"), []byte("sealed"), 0o644))
+
+		var mounted bool
+		runInMountNS(t, func() error {
+			targetFile, targetPath, err := openMountTarget(root, "dst")
+			if err != nil {
+				return err
+			}
+			defer targetFile.Close()
+
+			if err := mountPinnedTarget(targetPath, "rbind", container.Mount{
+				Source: source, Destination: "/dst", Writable: true,
+			}); err != nil {
+				return err
+			}
+			_, err = os.Stat(filepath.Join(root, "dst", "marker"))
+			mounted = err == nil
+			return nil
+		})
+		assert.Check(t, mounted, "the source was not mounted onto the destination")
+	})
+
+	t.Run("symlink swap after resolution cannot redirect the mount", func(t *testing.T) {
+		root, outside := scratchRootAndOutside(t)
+		source := t.TempDir()
+		assert.NilError(t, os.Mkdir(filepath.Join(root, "dst"), 0o755))
+		assert.NilError(t, os.WriteFile(filepath.Join(source, "marker"), []byte("sealed"), 0o644))
+
+		var pinnedGotMount, outsideGotMount bool
+		runInMountNS(t, func() error {
+			// The daemon resolves and pins the destination...
+			targetFile, targetPath, err := openMountTarget(root, "dst")
+			if err != nil {
+				return err
+			}
+			defer targetFile.Close()
+
+			// ...and here a container process wins the race, replacing the
+			// destination with a symlink to a host path. Pre-fix, the mount
+			// re-walked the destination as a string and would land in outside.
+			assert.NilError(t, os.Rename(filepath.Join(root, "dst"), filepath.Join(root, "stashed")))
+			assert.NilError(t, os.Symlink(outside, filepath.Join(root, "dst")))
+
+			if err := mountPinnedTarget(targetPath, "rbind", container.Mount{
+				Source: source, Destination: "/dst", Writable: true,
+			}); err != nil {
+				return err
+			}
+
+			_, err = os.Stat(filepath.Join(root, "stashed", "marker"))
+			pinnedGotMount = err == nil
+			_, err = os.Stat(filepath.Join(outside, "marker"))
+			outsideGotMount = err == nil
+			return nil
+		})
+
+		assert.Check(t, !outsideGotMount, "the mount was redirected to the host path %q", outside)
+		assert.Check(t, pinnedGotMount, "the mount did not land on the pinned destination")
+	})
+}
+
+// errNoPrivateMountNS reports that this environment cannot give us a mount
+// namespace to work in — a build container without CAP_SYS_ADMIN, typically.
+// The caller skips rather than fails: the test needs real mounts, and there is
+// nothing to assert if it cannot make any.
+var errNoPrivateMountNS = errors.New("no private mount namespace available")
+
+// inPrivateMountNS runs fn on a dedicated thread in a new mount namespace with
+// / made rslave, mirroring what openContainerFS does. The thread is never
+// unlocked, so it is destroyed when the goroutine returns, taking the namespace
+// and every mount fn made in it with it.
+func inPrivateMountNS(fn func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+			done <- fmt.Errorf("%w: unshare: %v", errNoPrivateMountNS, err)
+			return
+		}
+		if err := mount.MakeRSlave("/"); err != nil {
+			done <- fmt.Errorf("%w: make / rslave: %v", errNoPrivateMountNS, err)
+			return
+		}
+		done <- fn()
+	}()
+	return <-done
+}
+
+// runInMountNS runs fn in a private mount namespace, skipping the test when the
+// environment does not allow one.
+func runInMountNS(t *testing.T, fn func() error) {
+	t.Helper()
+	if err := inPrivateMountNS(fn); err != nil {
+		if errors.Is(err, errNoPrivateMountNS) {
+			t.Skip(err.Error())
+		}
+		t.Fatal(err)
+	}
 }

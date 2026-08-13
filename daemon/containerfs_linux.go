@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
+	"strconv"
 
 	"github.com/containerd/log"
 	securejoin "github.com/cyphar/filepath-securejoin"
@@ -94,9 +94,12 @@ func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSV
 				return err
 			}
 			for _, m := range mounts {
-				dest, err := ctr.GetResourcePath(m.Destination)
+				// Destination is an absolute path within the container
+				// filesystem. Make it relative to the container root so it can
+				// be resolved safely (scoped) against ctr.BaseFS.
+				relDest, err := filepath.Rel("/", m.Destination)
 				if err != nil {
-					return err
+					return fmt.Errorf("make destination relative: %w", err)
 				}
 
 				var stat os.FileInfo
@@ -104,7 +107,7 @@ func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSV
 				if err != nil {
 					return err
 				}
-				if err := createIfNotExists(ctr.BaseFS, strings.TrimPrefix(m.Destination, "/"), stat.IsDir()); err != nil {
+				if err := createIfNotExists(ctr.BaseFS, relDest, stat.IsDir()); err != nil {
 					return err
 				}
 
@@ -112,9 +115,7 @@ func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSV
 				if m.NonRecursive {
 					bindMode = "bind"
 				}
-				writeMode := "ro"
 				if m.Writable {
-					writeMode = "rw"
 					if m.ReadOnlyNonRecursive {
 						return errors.New("options conflict: Writable && ReadOnlyNonRecursive")
 					}
@@ -126,29 +127,17 @@ func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSV
 					return errors.New("options conflict: ReadOnlyNonRecursive && ReadOnlyForceRecursive")
 				}
 
-				// openContainerFS() is called for temporary mounts
-				// outside the container. Soon these will be unmounted
-				// with lazy unmount option and given we have mounted
-				// them rbind, all the submounts will propagate if these
-				// are shared. If daemon is running in host namespace
-				// and has / as shared then these unmounts will
-				// propagate and unmount original mount as well. So make
-				// all these mounts rprivate.  Do not use propagation
-				// property of volume as that should apply only when
-				// mounting happens inside the container.
-				opts := strings.Join([]string{bindMode, writeMode, "rprivate"}, ",")
-				if err := mount.Mount(m.Source, dest, "", opts); err != nil {
-					return err
+				// Pin the resolved mount destination with a file descriptor and
+				// mount onto /proc/self/fd/<fd>, so that a symlink swap racing
+				// the resolution cannot redirect the bind mount (TOCTOU).
+				targetFile, targetPath, err := openMountTarget(ctr.BaseFS, relDest)
+				if err != nil {
+					return fmt.Errorf("open mount target %q: %w", m.Destination, err)
 				}
-
-				if !m.Writable && !m.ReadOnlyNonRecursive {
-					if err := makeMountRRO(dest); err != nil {
-						if m.ReadOnlyForceRecursive {
-							return err
-						} else {
-							log.G(context.TODO()).WithError(err).Debugf("Failed to make %q recursively read-only", dest)
-						}
-					}
+				err = mountPinnedTarget(targetPath, bindMode, m)
+				targetFile.Close()
+				if err != nil {
+					return err
 				}
 			}
 
@@ -323,6 +312,71 @@ func createIfNotExists(rootPath, unsafePath string, isDir bool) error {
 		return &os.PathError{Op: "openat", Path: unsafePath, Err: err}
 	}
 	return unix.Close(fd)
+}
+
+// mountPinnedTarget bind-mounts m.Source onto targetPath, which must be the
+// /proc/self/fd path of a destination already resolved inside the container
+// root by [openMountTarget]. The kernel follows that file descriptor rather
+// than walking the path again, so a container process which swaps the
+// destination for a symlink after it was resolved cannot redirect the mount
+// out of the container root.
+//
+// Split from [openMountTarget] (the reference fix inlines both in
+// openContainerFS) so that a test can perform the swap in between the two and
+// exercise the real mount syscall.
+func mountPinnedTarget(targetPath, bindMode string, m container.Mount) error {
+	// The kernel rejects remount and propagation-change syscalls when the
+	// target is a /proc/self/fd path. Only the initial bind mount works on such
+	// paths, so we perform that via the fd path for TOCTOU safety and then
+	// resolve the real path for the read-only remount and propagation change.
+	if err := mount.Mount(m.Source, targetPath, "", bindMode); err != nil {
+		return err
+	}
+	realPath, err := os.Readlink(targetPath)
+	if err != nil {
+		return fmt.Errorf("readlink %s: %w", targetPath, err)
+	}
+	if !m.Writable {
+		if err := mount.Mount("", realPath, "", "ro,remount,bind"); err != nil {
+			return err
+		}
+	}
+
+	// openContainerFS() is called for temporary mounts
+	// outside the container. Soon these will be unmounted
+	// with lazy unmount option and given we have mounted
+	// them rbind, all the submounts will propagate if these
+	// are shared. If daemon is running in host namespace
+	// and has / as shared then these unmounts will
+	// propagate and unmount original mount as well. So make
+	// all these mounts rprivate.  Do not use propagation
+	// property of volume as that should apply only when
+	// mounting happens inside the container.
+	if err := mount.MakeRPrivate(realPath); err != nil {
+		return err
+	}
+
+	if !m.Writable && !m.ReadOnlyNonRecursive {
+		if err := makeMountRRO(realPath); err != nil {
+			if m.ReadOnlyForceRecursive {
+				return err
+			}
+			log.G(context.Background()).WithError(err).Debugf("Failed to make %q recursively read-only", m.Destination)
+		}
+	}
+	return nil
+}
+
+// openMountTarget resolves unsafePath scoped to rootPath and returns a handle
+// pinning the resolved inode along with a /proc/self/fd path referring to it.
+// Using that path as a mount target prevents a subsequent symlink swap from
+// redirecting the mount somewhere else.
+func openMountTarget(rootPath, unsafePath string) (*os.File, string, error) {
+	f, err := securejoin.OpenInRoot(rootPath, unsafePath)
+	if err != nil {
+		return nil, "", err
+	}
+	return f, "/proc/self/fd/" + strconv.FormatUint(uint64(f.Fd()), 10), nil
 }
 
 // makeMountRRO makes the mount recursively read-only.

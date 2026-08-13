@@ -15,197 +15,287 @@ concurrency:
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - 'master'
-      - '[0-9]+.[0-9]+'
-      - '[0-9]+.x'
-  pull_request:
 
 env:
   GO_VERSION: "1.24.8"
   GIT_PAGER: "cat"
   PAGER: "cat"
-  SETUP_BUILDX_VERSION: edge
-  SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
 
 jobs:
-  validate-dco:
-    uses: ./.github/workflows/.dco.yml
-
-  build-dev:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120 # guardrails timeout for the whole job
-    needs:
-      - validate-dco
+  unit:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        mode:
-          - ""
-          - systemd
-          - firewalld
+        os:
+          - ubuntu-24.04
+          - macos-latest
+          - windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       -
-        name: Prepare
+        name: Checkout
+        uses: actions/checkout@v4
+      -
+        name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      -
+        name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+      -
+        # The repository is pre-module: it ships vendor.mod / vendor.sum and no
+        # go.mod. Staging them as go.mod / go.sum lets `go test` run in
+        # module+vendor mode, which is what moby's own hack/with-go-mod.sh does.
+        name: Stage module files
         run: |
-          if [ "${{ matrix.mode }}" = "systemd" ]; then
-            echo "SYSTEMD=true" >> $GITHUB_ENV
+          cp vendor.mod go.mod
+          cp vendor.sum go.sum
+      -
+        # Reproduces the package selection and libnetwork/base split of moby's
+        # own hack/test/unit script.
+        name: Test
+        run: |
+          set -eu -o pipefail
+
+          # `-e` is required: on macOS and Windows many Linux-only packages have
+          # every file excluded by build constraints, and `go list` without `-e`
+          # would hard-fail on them.
+          PKGS=$(go list -e -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -vE '/vendor/|/integration')
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # These packages cannot compile on darwin at all: they import
+            # Linux-only internals (internal/containerfs, libnetwork/iptables,
+            # libnetwork/internal/nftables, internal/safepath, ...).
+            # Windows compiles all of them, so this subtraction is macOS-only.
+            # Exact full-import-path match (grep -vxF), so that e.g.
+            # daemon/logger/... and libnetwork/types are NOT dropped.
+            printf '%s\n' \
+              github.com/docker/docker/builder/builder-next/worker \
+              github.com/docker/docker/builder/dockerfile \
+              github.com/docker/docker/cmd/dockerd \
+              github.com/docker/docker/container \
+              github.com/docker/docker/daemon \
+              github.com/docker/docker/daemon/cluster \
+              github.com/docker/docker/daemon/cluster/controllers/plugin \
+              github.com/docker/docker/daemon/cluster/executor/container \
+              github.com/docker/docker/daemon/config \
+              github.com/docker/docker/daemon/containerd \
+              github.com/docker/docker/daemon/events \
+              github.com/docker/docker/daemon/images \
+              github.com/docker/docker/internal/safepath \
+              github.com/docker/docker/layer \
+              github.com/docker/docker/libnetwork \
+              github.com/docker/docker/libnetwork/portallocator \
+              github.com/docker/docker/oci \
+              github.com/docker/docker/plugin \
+              github.com/docker/docker/volume/local \
+              github.com/docker/docker/volume/mounts \
+              github.com/docker/docker/volume/service \
+              > /tmp/darwin-skip-pkgs.txt
+            # These three compile on darwin but cannot run on a non-root macOS
+            # host, which upstream never tests on (the Linux leg runs as root,
+            # as moby's own dev container does):
+            #   libnetwork/drivers/remote, libnetwork/ipams/remote — every test
+            #     goes through driver_test.go's setup, which mkdirs /etc/docker
+            #     -> "permission denied".
+            #   libnetwork/cnmallocator — drives the vendored swarmkit
+            #     allocator suite, whose watchNetwork poll loop times out on the
+            #     slower macOS arm64 runner.
+            printf '%s\n' \
+              github.com/docker/docker/libnetwork/cnmallocator \
+              github.com/docker/docker/libnetwork/drivers/remote \
+              github.com/docker/docker/libnetwork/ipams/remote \
+              >> /tmp/darwin-skip-pkgs.txt
+            PKGS=$(printf '%s\n' "$PKGS" | grep -vxF -f /tmp/darwin-skip-pkgs.txt)
+          fi
+
+          # Split as hack/test/unit does: libnetwork tests invoke iptables and
+          # cannot run in parallel. awk (not grep) so an empty half is not an
+          # error under `set -e`.
+          BASE_PKGS=$(printf '%s\n' "$PKGS" | awk 'NF && !/\/libnetwork/')
+          LIBNET=$(printf '%s\n' "$PKGS" | awk 'NF && /\/libnetwork/')
+
+          echo "base packages:"
+          printf '%s\n' "$BASE_PKGS"
+          echo "libnetwork packages:"
+          printf '%s\n' "$LIBNET"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # moby's own CI runs the unit tests as root inside its dev
+            # container, and these tests need root (graphdriver chown, netns,
+            # mounts). `sudo env "PATH=$PATH"` keeps the go toolchain and the
+            # module cache resolvable. -tags "netgo journald" matches
+            # hack/test/unit; journald is Linux-only.
+            sudo env "PATH=$PATH" HOME="$HOME" go test -mod=vendor -count=1 -tags "netgo journald" -timeout 20m $BASE_PKGS
+            if [ -n "$LIBNET" ]; then
+              # -skip TestFlaky.*: upstream's hack/test/unit also skips it in the
+              #   main run and reruns it separately with --rerun-fails=4.
+              # -skip TestUserChain: its iptables=false subtest asserts the error
+              #   text of the legacy iptables backend ("incompatible, use 'nft'
+              #   tool"), but GitHub's ubuntu-24.04 image resolves `iptables` to
+              #   the nft backend, so it gets "No chain/target/match by that
+              #   name" instead. Upstream only ever runs this inside its own dev
+              #   container, which pins the legacy backend.
+              sudo env "PATH=$PATH" HOME="$HOME" go test -mod=vendor -count=1 -tags "netgo journald" -p=1 -skip 'TestFlaky.*|TestUserChain' -timeout 25m $LIBNET
+            fi
+          else
+            # Upstream never runs the unit suite on a bare macOS/Windows host
+            # (its Windows leg runs inside a Windows container), so a handful of
+            # tests assume a Linux host and fail on the runner itself.
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              # TestWriteTimeoutIsEffective: binds a unix socket under macOS's
+              #   long per-user $TMPDIR (/var/folders/...), which overflows the
+              #   104-byte sun_path limit -> "bind: invalid argument".
+              # TestLookupUserAndGroupThatDoesNotExist: asserts on getent's
+              #   error text, and macOS ships no getent(1).
+              SKIP='TestWriteTimeoutIsEffective|TestLookupUserAndGroupThatDoesNotExist'
+            else
+              # TestV1Endpoint: expects expanding an endpoint at bare 127.0.0.1
+              #   (ports 80/443) to error out; on the Windows runner something
+              #   is listening there, so the expected error never happens.
+              SKIP='TestV1Endpoint'
+            fi
+            # journald / netgo build tags are Linux-only, and the runner user
+            # already owns everything it needs here.
+            go test -mod=vendor -count=1 -skip "$SKIP" -timeout 20m $BASE_PKGS
+            if [ -n "$LIBNET" ]; then
+              # See the Linux branch above for why TestFlaky.*/TestUserChain are
+              # skipped.
+              go test -mod=vendor -count=1 -p=1 -skip "TestFlaky.*|TestUserChain|$SKIP" -timeout 25m $LIBNET
+            fi
           fi
       -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
+        # Re-run the docker cp unit tests verbosely so the log records each one
+        # by name. They already ran as part of ./daemon above; this is evidence,
+        # not extra coverage. Linux-only: the package is //go:build linux, and
+        # TestMountPinnedTarget needs a mount namespace, so it must run as root.
+        name: Test docker cp fixes (linux, verbose)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo env "PATH=$PATH" HOME="$HOME" go test -mod=vendor -count=1 -v -tags "netgo journald" -timeout 10m -run 'TestCreateIfNotExists|TestOpenMountTarget|TestMountPinnedTarget|TestContainerExtractToDirDecompressesOnHost|TestExtractDecompressionHelperNeverRunsInContainerFS' ./daemon/
       -
-        name: Build dev image
-        uses: docker/bake-action@v6
-        with:
-          targets: dev
-          set: |
-            *.cache-from=type=gha,scope=dev${{ matrix.mode }}
-            *.cache-to=type=gha,scope=dev${{ matrix.mode }}
-            *.output=type=cacheonly
+        # Upstream's CVE-2026-41567 regression test lives in integration/container,
+        # which needs a live daemon and cannot run here; type-check it at least.
+        name: Vet daemon and integration packages (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
 
-  test:
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - build-dev
-      - validate-dco
-    uses: ./.github/workflows/.test.yml
-    secrets: inherit
-    strategy:
-      fail-fast: false
-      matrix:
-        storage:
-          - graphdriver
-          - snapshotter
-    with:
-      storage: ${{ matrix.storage }}
-
-  test-unit:
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - build-dev
-      - validate-dco
-    uses: ./.github/workflows/.test-unit.yml
-    secrets: inherit
-
-  validate-prepare:
+  module-zip:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10 # guardrails timeout for the whole job
+    timeout-minutes: 30
     needs:
-      - validate-dco
-    outputs:
-      matrix: ${{ steps.scripts.outputs.matrix }}
+      - unit
+    defaults:
+      run:
+        shell: bash
     steps:
       -
         name: Checkout
         uses: actions/checkout@v4
       -
-        name: Create matrix
-        id: scripts
-        run: |
-          scripts=$(cd ./hack/validate && jq -nc '$ARGS.positional - ["all", "default", "dco"] | map(select(test("[.]")|not)) + ["generate-files"]' --args *)
-          echo "matrix=$scripts" >> $GITHUB_OUTPUT
+        name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
       -
-        name: Show matrix
+        name: Prune non-shipped files
         run: |
-          echo ${{ steps.scripts.outputs.matrix }}
+          set -eu
+          # These five are git symlinks into integration/testdata/. The proxy
+          # zip omits them (it keeps only the real *-rogue*.pem files) and
+          # zip.CreateFromDir cannot archive irregular files.
+          rm -f integration-cli/fixtures/https/server-key.pem \
+                integration-cli/fixtures/https/client-key.pem \
+                integration-cli/fixtures/https/server-cert.pem \
+                integration-cli/fixtures/https/ca.pem \
+                integration-cli/fixtures/https/client-cert.pem
+          # The published +incompatible zip contains neither go.mod nor go.sum;
+          # their absence is what makes the module pre-module.
+          rm -f go.mod go.sum
+      -
+        name: Build zip helper
+        run: |
+          set -eu
+          # Keep the helper module outside the workspace and outside GOPATH so
+          # nothing of it can end up in the module zip.
+          mkdir -p /tmp/helper
+          cat > /tmp/helper/main.go <<'EOF'
+          package main
 
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30 # guardrails timeout for the whole job
-    needs:
-      - validate-prepare
-      - build-dev
-    strategy:
-      fail-fast: true
-      matrix:
-        script: ${{ fromJson(needs.validate-prepare.outputs.matrix) }}
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      -
-        name: Set up runner
-        uses: ./.github/actions/setup-runner
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Build dev image
-        uses: docker/bake-action@v6
-        with:
-          targets: dev
-          set: |
-            dev.cache-from=type=gha,scope=dev
-      -
-        name: Validate
-        run: |
-          make -o build validate-${{ matrix.script }}
+          import (
+              "fmt"
+              "os"
 
-  smoke-prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10 # guardrails timeout for the whole job
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - validate-dco
-    outputs:
-      matrix: ${{ steps.platforms.outputs.matrix }}
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
-        name: Create matrix
-        id: platforms
-        run: |
-          matrix="$(docker buildx bake binary-smoketest --print | jq -cr '.target."binary-smoketest".platforms')"
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
-      -
-        name: Show matrix
-        run: |
-          echo ${{ steps.platforms.outputs.matrix }}
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
 
-  smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20 # guardrails timeout for the whole job
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - smoke-prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJson(needs.smoke-prepare.outputs.matrix) }}
-    steps:
+          func main() {
+              if len(os.Args) != 5 {
+                  fmt.Fprintln(os.Stderr, "usage: create_mod <out.zip> <module-path> <version> <dir>")
+                  os.Exit(2)
+              }
+              out, modPath, version, dir := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+
+              f, err := os.Create(out)
+              if err != nil {
+                  fmt.Fprintln(os.Stderr, "create:", err)
+                  os.Exit(1)
+              }
+              if err := zip.CreateFromDir(f, module.Version{Path: modPath, Version: version}, dir); err != nil {
+                  f.Close()
+                  fmt.Fprintln(os.Stderr, "CreateFromDir:", err)
+                  os.Exit(1)
+              }
+              if err := f.Close(); err != nil {
+                  fmt.Fprintln(os.Stderr, "close:", err)
+                  os.Exit(1)
+              }
+              fmt.Println("wrote", out)
+          }
+          EOF
+          cd /tmp/helper
+          go mod init helper
+          # `go get` (not `go mod edit -require` + `go mod download`) because
+          # only `go get` writes go.sum, without which the build fails with
+          # "missing go.sum entry". x/mod is pinned at v0.24.0: newer versions
+          # require a newer Go toolchain.
+          go get golang.org/x/mod@v0.24.0
+          go build -o /tmp/helper/create_mod .
       -
-        name: Prepare
+        name: Create module zip
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          set -eu
+          # Artifact dir lives outside the workspace so it cannot be swept into
+          # the zip.
+          mkdir -p "/tmp/artifact"
+          # CreateFromDir already excludes .git/ and all of vendor/ except
+          # vendor/modules.txt, which is exactly what the proxy zip contains.
+          /tmp/helper/create_mod \
+            "/tmp/artifact/v28.5.1+incompatible.zip" \
+            github.com/docker/docker \
+            v28.5.1+incompatible \
+            "${{ github.workspace }}"
       -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        name: List module zip contents
+        run: |
+          set -eu
+          unzip -l "/tmp/artifact/v28.5.1+incompatible.zip"
       -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        name: Upload module zip
+        uses: actions/upload-artifact@v4
         with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Test
-        uses: docker/bake-action@v6
-        with:
-          targets: binary-smoketest
-          set: |
-            *.platform=${{ matrix.platform }}
+          name: module-zip
+          path: /tmp/artifact/v28.5.1+incompatible.zip
+          if-no-files-found: error
